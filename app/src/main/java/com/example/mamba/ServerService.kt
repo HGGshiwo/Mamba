@@ -73,15 +73,15 @@ class ServerService : Service() {
         server.get("/page_config") { request, response ->
             val pageConfig = buildJsonObject {
                 putJsonArray("state") {
+//                    addJsonObject {
+//                        put("name", "服务状态")
+//                        put("key", "status")
+//                        put("collapse", false)
+//                    }
                     addJsonObject {
-                        buildJsonObject {
-                            put("name", "服务状态")
-                            put("key", "status")
-                        }
-                        buildJsonObject {
-                            put("name", "连接数量")
-                            put("key", "connect_num")
-                        }
+                        put("name", "连接数量")
+                        put("key", "connect_num")
+                        put("collapse", false)
                     }
                 }
             }
@@ -102,7 +102,32 @@ class ServerService : Service() {
             response.send(gpsData.toString())
         }
 
-        server.directory(this, "/home/assets", "web/assets")
+        server.get("/home/assets/.*") { request, response ->
+            // 把 /home/assets/logo.png 转换成 logo.png
+            var filePath = request.path.removePrefix("/home/assets/")
+            filePath = "web/assets/${filePath}"
+            Log.d("ServerService", "请求静态资源: $filePath")
+
+            try {
+                val inputStream = assets.open(filePath)
+                val bytes = inputStream.readBytes()
+
+                // 根据文件扩展名设置正确的 MIME 类型
+                val mimeType = when {
+                    filePath.endsWith(".png") -> "image/png"
+                    filePath.endsWith(".jpg") || filePath.endsWith(".jpeg") -> "image/jpeg"
+                    filePath.endsWith(".css") -> "text/css"
+                    filePath.endsWith(".js") -> "application/javascript"
+                    filePath.endsWith(".json") -> "application/json"
+                    else -> "application/octet-stream"
+                }
+
+                response.send(mimeType, bytes)
+            } catch (e: Exception) {
+                Log.e("ServerService", "读取文件失败: $filePath, 错误: ${e.message}")
+                response.code(404).send("文件不存在: $filePath")
+            }
+        }
 
         // 响应 WebSocket 请求
         server.websocket("/ws") { webSocket, request ->
