@@ -3,27 +3,55 @@ package com.example.mamba
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import com.google.android.gms.location.*
 import com.koushikdutta.async.http.WebSocket
 import com.koushikdutta.async.http.server.AsyncHttpServer
 import kotlinx.serialization.json.*
+import android.Manifest
+import android.location.GnssStatus
+import android.location.LocationListener
+import android.location.OnNmeaMessageListener
+import android.os.BatteryManager
+import android.os.Handler
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.pow
+
+fun Double.truncate(decimals: Int): Double {
+    val factor = 10.0.pow(decimals)
+    return (this * factor).toInt() / factor
+}
 
 class ServerService : Service() {
 
     private val server = AsyncHttpServer()
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var lat: Double = 0.0
     private var lon: Double = 0.0
     private var alt: Double = 0.0
     private val TAG = "ServerService"
 
-    private var wsClientList: ArrayList<WebSocket> = ArrayList()
+    // 在类的顶部声明变量：
+    private lateinit var locationManager: LocationManager
+    private lateinit var locationListener: LocationListener
+    private var batteryLevel: Int = 0          // 手机电量 (0-100)
+    private var satellitesTotal: Int = 0       // 可见卫星总数
+    private var satellitesUsed: Int = 0        // 实际参与定位的卫星数
+    private var fixType: Int = 0               // GPS Fix Type (0=无效, 1=单点定位, 2=差分定位/RTK)
+
+    // 监听器声明
+    private lateinit var gnssStatusCallback: GnssStatus.Callback
+    private lateinit var nmeaListener: OnNmeaMessageListener
+    private var wsClientList = CopyOnWriteArrayList<WebSocket>()
 
     override fun onCreate() {
         super.onCreate()
@@ -83,15 +111,69 @@ class ServerService : Service() {
                         put("key", "connect_num")
                         put("collapse", false)
                     }
+                    addJsonObject {
+                        put("name", "经度")
+                        put("key", "lon")
+                        put("collapse", false)
+                    }
+                    addJsonObject {
+                        put("name", "纬度")
+                        put("key", "lat")
+                        put("collapse", false)
+                    }
+                    addJsonObject {
+                        put("name", "电池电量")
+                        put("key", "battery_level")
+                        put("collapse", false)
+                    }
+                    addJsonObject {
+                        put("name", "GPS星数")
+                        put("key", "gps_nsats")
+                        put("collapse", false)
+                    }
+                    addJsonObject {
+                        put("name", "GPS fix_type")
+                        put("key", "gps_fix_type")
+                        put("collapse", false)
+                    }
+                }
+                putJsonArray("button") {
+                    addJsonObject {
+                        put("key", "get_gps")
+                        put("name", "获取gps")
+                        putJsonObject("target") {
+                            put("config_type", "toast")
+                            put("method", "GET")
+                            put("url", "/get_gps")
+                        }
+                    }
+                    addJsonObject {
+                        put("key", "prearms")
+                        put("name", "起飞检查")
+                        putJsonObject("target") {
+                            put("config_type", "toast")
+                            put("method", "GET")
+                            put("url", "/prearms")
+                        }
+                    }
+                    addJsonObject {
+                        put("key", "takeoff")
+                        put("name", "起飞")
+                        putJsonObject("target") {
+                            put("config_type", "toast")
+                            put("method", "POST")
+                            put("url", "/takeoff")
+                        }
+                    }
                 }
             }
             Log.d(TAG, String.format("get_page_config %s", pageConfig.toString()))
             response.send(pageConfig.toString())
         }
 
-        server.get("/gps") { request, response ->
+        server.get("/get_gps") { request, response ->
             val gpsData = buildJsonObject {
-                put("status", "OK")
+                put("status", "success")
                 putJsonArray("msg") {
                     add(lon)
                     add(lat)
@@ -100,6 +182,32 @@ class ServerService : Service() {
             }
             Log.d(TAG, String.format("get_gps %s", gpsData.toString()))
             response.send(gpsData.toString())
+        }
+
+        server.get("/prearms") { request, response ->
+            val data = buildJsonObject {
+                put("status", "success")
+                putJsonObject("msg") {
+                    put("arm", true)
+                }
+            }
+            response.send(data.toString())
+        }
+
+        server.post("/takeoff") { request, response ->
+            val data = buildJsonObject {
+                put("status", "success")
+                put("msg", "OK")
+            }
+            response.send(data.toString())
+        }
+
+        server.post("/set_waypoint") { request, response ->
+            val data = buildJsonObject {
+                put("status", "success")
+                put("msg", "OK")
+            }
+            response.send(data.toString())
         }
 
         server.get("/home/assets/.*") { request, response ->
@@ -148,40 +256,144 @@ class ServerService : Service() {
 
     // --- 3. 获取经纬度逻辑 ---
     private fun startLocationUpdates() {
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        // 1. 创建位置监听器
+        locationListener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                Log.d(
+                    TAG,
+                    "原生定位获取成功: 纬度=${location.latitude}, 经度=${location.longitude}"
+                )
 
-        // 设置定位请求参数：高精度，每2秒获取一次
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000).build()
+                lat = location.latitude
+                lon = location.longitude
+                alt = location.altitude
 
-        val locationCallback = object : LocationCallback() {
-            override fun onLocationResult(locationResult: LocationResult) {
-                for (location in locationResult.locations) {
-                    lat = location.latitude
-                    lon = location.longitude
-                    alt = location.altitude
-                }
+                // 获取电量非常简单，直接调用系统服务
+                val batteryManager = getSystemService(BATTERY_SERVICE) as BatteryManager
+                batteryLevel =
+                    batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+                // 发送给 WebSocket 客户端
                 val size = wsClientList.size
-                for(ws in wsClientList){
-                    ws.send(buildJsonObject {
-                        put("type", "state")
-                        put("connect_num", size)
-                    }.toString())
+                val realFixType = if (fixType == 0) 0 else fixType + 2
+                var data = buildJsonObject {
+                    put("type", "state")
+                    put("connect_num", size)
+                    put("lat", lat.truncate(5))
+                    put("lon", lon.truncate(5))
+                    put("battery_level", batteryLevel)
+                    put("gps_nsats", satellitesUsed)
+                    put("gps_fix_type", realFixType)
+                }.toString()
+
+                for (ws in wsClientList) {
+                    ws.send(data)
                 }
             }
-        }
 
+            // 下面这三个方法在较新的 Android 版本中是可选的，但为了兼容老版本建议保留空实现
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) {
+                Log.d(TAG, "定位服务开启: $provider")
+            }
+
+            override fun onProviderDisabled(provider: String) {
+                Log.d(TAG, "定位服务关闭: $provider")
+            }
+        }
+        // 2. 检查权限 (必须检查，否则 IDE 会报错，代码也会崩溃)
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+            && ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.e(TAG, "没有定位权限！请先在 Activity 中动态申请权限。")
+            return
+        }
         try {
-            fusedLocationClient.requestLocationUpdates(
-                locationRequest, locationCallback, Looper.getMainLooper()
-            )
-        } catch (e: SecurityException) {
-            e.printStackTrace() // 注意：实际应用需确保已授权
+            // 3. 注册定位监听 (这里同时注册 GPS 和 网络定位，保证室内外都有回调)
+            val minTimeMs = 2000L // 最小更新间隔 2000 毫秒 (2秒)
+            val minDistanceM = 0f // 最小更新距离 0 米 (只要时间到了就更新)
+            // 尝试使用网络定位 (基站/Wi-Fi，速度快，室内可用，精度低)
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER, minTimeMs, minDistanceM, locationListener
+                )
+                Log.d(TAG, "已启动 NETWORK_PROVIDER 定位")
+            }
+
+
+            // 注册 GNSS 状态监听器 (Android 7.0 / API 24 引入)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                gnssStatusCallback = object : GnssStatus.Callback() {
+                    override fun onSatelliteStatusChanged(status: GnssStatus) {
+                        satellitesTotal = status.satelliteCount
+                        var used = 0
+                        for (i in 0 until satellitesTotal) {
+                            if (status.usedInFix(i)) used++
+                        }
+                        satellitesUsed = used
+                        Log.d(TAG, "可见卫星: $satellitesTotal, 参与定位: $satellitesUsed")
+                    }
+                }
+                // 权限前面已经查过了，这里直接注册
+                try {
+                    locationManager.registerGnssStatusCallback(
+                        gnssStatusCallback,
+                        Handler(Looper.getMainLooper())
+                    )
+                } catch (e: SecurityException) {
+                    e.printStackTrace()
+                }
+            }
+            // 尝试使用卫星定位 (GPS，速度慢，仅室外可用，精度极高)
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER, minTimeMs, minDistanceM, locationListener
+                )
+                Log.d(TAG, "已启动 GPS_PROVIDER 定位")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "请求定位失败: ${e.message}")
+        }
+        // 注册 NMEA 监听器 (Android 7.0 / API 24 引入)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            nmeaListener = OnNmeaMessageListener { message, timestamp ->
+                // 抓取 GGA 报文 (通常是 $GPGGA, $GLGGA, $GNGGA)
+                if (message.startsWith("\$GPGGA") || message.startsWith("\$GNGGA")) {
+                    val parts = message.split(",")
+                    // GGA 报文用逗号分隔，第6个索引位置代表 Fix Quality
+                    if (parts.size > 6 && parts[6].isNotEmpty()) {
+                        val newFixType = parts[6].toIntOrNull() ?: 0
+                        if (fixType != newFixType) {
+                            fixType = newFixType
+                            Log.d(TAG, "GPS FixType 更新为: $fixType")
+                        }
+                    }
+                }
+            }
+            try {
+                locationManager.addNmeaListener(nmeaListener, Handler(Looper.getMainLooper()))
+            } catch (e: SecurityException) {
+                e.printStackTrace()
+            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        server.stop() // 服务销毁时停止服务器
+        server.stop()
+
+        // 停止原生定位
+        if (::locationManager.isInitialized && ::locationListener.isInitialized) {
+            locationManager.removeUpdates(locationListener)
+            Log.d(TAG, "已停止定位监听")
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
